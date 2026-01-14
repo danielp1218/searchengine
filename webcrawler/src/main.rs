@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 use futures::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+use serde_json;
 
 const MAX_PAGES: usize = 1000;
 const CONCURRENCY: usize = 50;
@@ -17,6 +20,16 @@ async fn main() {
     let seeds = vec![
         "https://student.cs.uwaterloo.ca/~cs145/".to_string()
     ];
+    
+    // Create JSONL output file
+    let output_file = Arc::new(Mutex::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("crawled_pages.jsonl")
+            .await
+            .expect("Failed to create output file")
+    ));
     
     let visited = Arc::new(Mutex::new(HashSet::new()));
     let pages_count = Arc::new(AtomicUsize::new(0));
@@ -57,6 +70,7 @@ async fn main() {
             let visited = visited.clone();
             let pages_count = pages_count.clone();
             let discovered_tx = discovered_tx.clone();
+            let output_file = output_file.clone();
             
             async move {
                 let current_count = pages_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -64,7 +78,7 @@ async fn main() {
                     return;
                 }
                 
-                match process_link(url).await {
+                match process_link(url, output_file).await {
                     Some(child_links) => {
                         // Add discovered links to visited set and queue
                         for link in child_links {
@@ -85,15 +99,22 @@ async fn main() {
     batch_task.await.unwrap();
     
     println!("Crawl complete! Processed {} pages", pages_count.load(Ordering::Relaxed));
+    println!("Results saved to crawled_pages.jsonl");
 }
 
-async fn process_link(link: String) -> Option<Vec<String>> {
+async fn process_link(link: String, output_file: Arc<Mutex<tokio::fs::File>>) -> Option<Vec<String>> {
     println!("Processing: {}", link);
     
     let request = reqwest::get(&link).await;
     if let Ok(response) = request {
         let html_content = response.text().await.ok()?;
         let parsed = parser::parse_html(html_content, &link);
+        
+        // Write parsed data as JSON line
+        let json_line = serde_json::to_string(&parsed).ok()?;
+        let mut file = output_file.lock().await;
+        file.write_all(json_line.as_bytes()).await.ok()?;
+        file.write_all(b"\n").await.ok()?;
         
         let links: Vec<String> = parsed.links.into_iter().collect();
         println!("Found {} links", links.len());
