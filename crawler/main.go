@@ -9,27 +9,31 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-const NUM_WORKERS = 50
+const NUM_WORKERS = 1000
 
-func crawl(url string, q *structs.UrlQueue) error {
+func crawl(url string, q *structs.UrlQueue, statsTrackerChan chan<- structs.StatsEvent) error {
 	resp, err := http.Get(url)
 	if err != nil {
+		statsTrackerChan <- structs.StatsEvent{Type: "failed"}
 		return err
 	}
 
 	parsedHTML, err := parser.ParseHTML(resp.Body, url)
 	if err != nil {
+		statsTrackerChan <- structs.StatsEvent{Type: "failed"}
 		return err
 	}
 	for _, link := range parsedHTML.Links {
 		//print(link, "\n")
 		err := q.Enqueue(link)
+		statsTrackerChan <- structs.StatsEvent{Type: "discovered"}
 		if err != nil {
 			log.Println("Failed to enqueue link:", link, err)
 		}
 	}
 
 	defer resp.Body.Close()
+	statsTrackerChan <- structs.StatsEvent{Type: "crawled"}
 	return nil
 }
 
@@ -51,6 +55,9 @@ func main() {
 	
     sem := make(chan struct{}, NUM_WORKERS)
     
+	statsTrackerChan := make(chan structs.StatsEvent, 1000)
+	go structs.StatsTracker(statsTrackerChan, q.QueueSize())
+
     for {
         sem <- struct{}{} // wait for worker slot
 
@@ -60,6 +67,7 @@ func main() {
             log.Println("Error dequeuing:", err)
             continue
         }
+		
         
         go func(msg jetstream.Msg) {
             defer func() { <-sem }()
@@ -67,7 +75,7 @@ func main() {
 			url := string(msg.Data())
             
 
-			if err := crawl(url, q); err != nil {
+			if err := crawl(url, q, statsTrackerChan); err != nil {
                 msg.Nak() // requeue
             } else {
                 msg.Ack() // success
