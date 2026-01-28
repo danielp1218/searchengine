@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/dtpu/searchengine/crawler/structs"
 	zone "github.com/lrstanley/bubblezone"
+	"github.com/nats-io/nats.go"
 )
 
 // CrawlerState represents the current state of the crawler
@@ -59,6 +61,12 @@ type model struct {
 	// Time series data history
 	crawlHistory []timePoint
 	maxHistory   int
+
+	// Crawler control
+	statsChan  chan structs.Stats
+	ctx        context.Context
+	cancelFunc context.CancelFunc
+	errorMsg   string
 }
 
 type timePoint struct {
@@ -71,18 +79,43 @@ type tickMsg time.Time
 type statsUpdateMsg structs.Stats
 type stateChangeMsg CrawlerState
 
+// checkNATSConnection verifies that NATS server is reachable
+func checkNATSConnection() error {
+	nc, err := nats.Connect("nats://localhost:4222", nats.Timeout(2*time.Second))
+	if err != nil {
+		return err
+	}
+	defer nc.Close()
+	return nil
+}
+
+// waitForStatsUpdate creates a command that waits for stats updates from the channel
+func waitForStatsUpdate(statsChan <-chan structs.Stats) tea.Cmd {
+	return func() tea.Msg {
+		select {
+		case stats := <-statsChan:
+			return statsUpdateMsg(stats)
+		case <-time.After(5 * time.Second):
+			// Timeout to prevent blocking forever
+			return nil
+		}
+	}
+}
+
 func initialModel() model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
 	// Initialize time series chart
-	chart := timeserieslinechart.New(60, 12,
+	chart := timeserieslinechart.New(60, 5,
 		timeserieslinechart.WithXLabelFormatter(timeserieslinechart.HourTimeLabelFormatter()),
 	)
 	chart.AxisStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	chart.LabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
 	chart.DrawBraille()
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return model{
 		state:       StateStopped,
@@ -90,6 +123,9 @@ func initialModel() model {
 		zoneManager: zone.New(),
 		chart:       chart,
 		maxHistory:  60,
+		statsChan:   make(chan structs.Stats, 100),
+		ctx:         ctx,
+		cancelFunc:  cancel,
 
 		// Initialize springs with critically damped settings (damping=1.0) for smooth, professional transitions
 		// Frequency of 8.0 provides snappy updates
@@ -123,7 +159,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Resize chart to fit window
 		chartWidth := min(m.width-4, 100)
-		chartHeight := min(m.height/2-4, 15)
+		chartHeight := min(m.height/2-4, 5)
 		m.chart = timeserieslinechart.New(chartWidth, chartHeight,
 			timeserieslinechart.WithXLabelFormatter(timeserieslinechart.HourTimeLabelFormatter()),
 		)
@@ -144,43 +180,109 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case " ":
-			// Toggle pause/resume
+			// Toggle pause/resume (force stop and restart)
 			if m.state == StateRunning {
 				m.state = StatePaused
+				if m.cancelFunc != nil {
+					m.cancelFunc()
+				}
 			} else if m.state == StatePaused {
-				m.state = StateRunning
+				if err := checkNATSConnection(); err != nil {
+					m.errorMsg = fmt.Sprintf("NATS connection failed: %v", err)
+				} else {
+					m.errorMsg = ""
+					m.state = StateRunning
+					m.ctx, m.cancelFunc = context.WithCancel(context.Background())
+					//go startCrawler(m.ctx, m.statsChan)
+					cmds = append(cmds, waitForStatsUpdate(m.statsChan))
+				}
 			}
 		case "s":
 			// Start crawler
 			if m.state == StateStopped {
-				m.state = StateRunning
+				if err := checkNATSConnection(); err != nil {
+					m.errorMsg = fmt.Sprintf("NATS connection failed: %v", err)
+				} else {
+					m.errorMsg = ""
+					m.state = StateRunning
+					m.ctx, m.cancelFunc = context.WithCancel(context.Background())
+					//go startCrawler(m.ctx, m.statsChan)
+					cmds = append(cmds, waitForStatsUpdate(m.statsChan))
+				}
 			}
 		case "r":
 			// Restart crawler
-			m.state = StateRunning
+			if m.cancelFunc != nil {
+				m.cancelFunc()
+			}
 			m.stats = structs.Stats{}
 			m.crawlHistory = nil
 			m.animPagesCrawled = 0
 			m.animPagesFailed = 0
 			m.animLinksFound = 0
 			m.animQueueSize = 0
+			if err := checkNATSConnection(); err != nil {
+				m.errorMsg = fmt.Sprintf("NATS connection failed: %v", err)
+				m.state = StateStopped
+			} else {
+				m.errorMsg = ""
+				m.state = StateRunning
+				m.ctx, m.cancelFunc = context.WithCancel(context.Background())
+				//go startCrawler(m.ctx, m.statsChan)
+				cmds = append(cmds, waitForStatsUpdate(m.statsChan))
+			}
 		}
 
 	case tea.MouseMsg:
 		if msg.Action == tea.MouseActionRelease && msg.Button == tea.MouseButtonLeft {
 			if m.zoneManager.Get("btn-start").InBounds(msg) && m.state == StateStopped {
-				m.state = StateRunning
+				if err := checkNATSConnection(); err != nil {
+					m.errorMsg = fmt.Sprintf("NATS connection failed: %v", err)
+				} else {
+					m.errorMsg = ""
+					m.state = StateRunning
+					m.ctx, m.cancelFunc = context.WithCancel(context.Background())
+					//go startCrawler(m.ctx, m.statsChan)
+					cmds = append(cmds, waitForStatsUpdate(m.statsChan))
+				}
 			}
 			if m.zoneManager.Get("btn-pause").InBounds(msg) && m.state == StateRunning {
 				m.state = StatePaused
+				if m.cancelFunc != nil {
+					m.cancelFunc()
+				}
 			}
 			if m.zoneManager.Get("btn-resume").InBounds(msg) && m.state == StatePaused {
-				m.state = StateRunning
+				if err := checkNATSConnection(); err != nil {
+					m.errorMsg = fmt.Sprintf("NATS connection failed: %v", err)
+				} else {
+					m.errorMsg = ""
+					m.state = StateRunning
+					m.ctx, m.cancelFunc = context.WithCancel(context.Background())
+					//go startCrawler(m.ctx, m.statsChan)
+					cmds = append(cmds, waitForStatsUpdate(m.statsChan))
+				}
 			}
 			if m.zoneManager.Get("btn-restart").InBounds(msg) {
-				m.state = StateRunning
+				if m.cancelFunc != nil {
+					m.cancelFunc()
+				}
 				m.stats = structs.Stats{}
 				m.crawlHistory = nil
+				m.animPagesCrawled = 0
+				m.animPagesFailed = 0
+				m.animLinksFound = 0
+				m.animQueueSize = 0
+				if err := checkNATSConnection(); err != nil {
+					m.errorMsg = fmt.Sprintf("NATS connection failed: %v", err)
+					m.state = StateStopped
+				} else {
+					m.errorMsg = ""
+					m.state = StateRunning
+					m.ctx, m.cancelFunc = context.WithCancel(context.Background())
+					//go startCrawler(m.ctx, m.statsChan)
+					cmds = append(cmds, waitForStatsUpdate(m.statsChan))
+				}
 			}
 		}
 
@@ -231,10 +333,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Value: pt.value,
 		})
 
+		// Continue waiting for more stats updates
+		if m.state == StateRunning {
+			cmds = append(cmds, waitForStatsUpdate(m.statsChan))
+		}
+
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		cmds = append(cmds, cmd)
+
+	default:
+		// For nil messages (like timeout from waitForStatsUpdate), keep polling if running
+		if m.state == StateRunning {
+			cmds = append(cmds, waitForStatsUpdate(m.statsChan))
+		}
 	}
 
 	return m, tea.Batch(cmds...)
@@ -393,13 +506,15 @@ func (m model) View() string {
 		MarginTop(1).
 		Render(lipgloss.JoinHorizontal(lipgloss.Top, startBtn, pauseBtn, restartBtn, quitBtn))
 
-	// Help text
-	helpStyle := lipgloss.NewStyle().
-		Foreground(dimColor).
-		MarginTop(1).
-		Padding(0, 1)
-
-	help := helpStyle.Render("Use keyboard shortcuts or click buttons • Arrow keys to navigate")
+	// Error message if any
+	errorView := ""
+	if m.errorMsg != "" {
+		errorStyle := lipgloss.NewStyle().
+			Foreground(errorColor).
+			MarginTop(1).
+			Padding(0, 1)
+		errorView = errorStyle.Render("⚠️  " + m.errorMsg)
+	}
 
 	// Combine all sections
 	view := lipgloss.JoinVertical(
@@ -408,7 +523,7 @@ func (m model) View() string {
 		statsRow,
 		chartPanel,
 		controls,
-		help,
+		errorView,
 	)
 
 	return m.zoneManager.Scan(view)

@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
+	"time"
 
 	"github.com/dtpu/searchengine/crawler/parser"
 	"github.com/dtpu/searchengine/crawler/structs"
@@ -40,11 +40,9 @@ func crawl(url string, q *structs.UrlQueue, statsTrackerChan chan<- structs.Stat
 func startCrawler() {
 	q, err := structs.InitializeQueue("nats://localhost:4222")
 	if err != nil {
-		panic(err)
+		panic("Failed to initialize queue:" + err.Error())
 	}
 	defer q.Close()
-
-	print("Queue size: ", q.QueueSize(), "\n")
 
 	// seed initial URLs
 	q.EnqueueBatch([]string{
@@ -55,7 +53,31 @@ func startCrawler() {
 	sem := make(chan struct{}, NUM_WORKERS)
 
 	statsTrackerChan := make(chan structs.StatsEvent, 1000)
-	go structs.StatsTracker(statsTrackerChan, q.QueueSize())
+
+	// start stats tracker
+	go func() {
+		stats := structs.Stats{}
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case event := <-statsTrackerChan:
+				switch event.Type {
+				case "crawled":
+					stats.PagesCrawled++
+				case "failed":
+					stats.PagesFailed++
+				case "discovered":
+					stats.LinksFound++
+				}
+			case <-ticker.C:
+				stats.QueueSize = q.QueueSize()
+				log.Printf("Stats - Crawled: %d, Failed: %d, Links Found: %d, Queue Size: %d\n",
+					stats.PagesCrawled, stats.PagesFailed, stats.LinksFound, stats.QueueSize)
+			}
+		}
+	}()
 
 	for {
 		sem <- struct{}{} // wait for worker slot
@@ -82,8 +104,5 @@ func startCrawler() {
 }
 
 func main() {
-	if err := runTUI(); err != nil {
-		log.Println("Error running TUI:", err)
-		os.Exit(1)
-	}
+	startCrawler()
 }
