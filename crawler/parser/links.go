@@ -1,8 +1,15 @@
 package parser
 
 import (
+	"errors"
+	"net"
 	"net/url"
+	"strings"
+
+	"golang.org/x/net/publicsuffix"
 )
+
+var ErrEmptyHost = errors.New("url host is empty")
 
 func isFileLink(link string) bool {
 	fileExtensions := []string{
@@ -39,7 +46,33 @@ func isValidURL(toTest string) bool {
 func GetDomain(link string) (string, error) {
 	parsedURL, err := url.Parse(link)
 	if err != nil {
-		return "", err
+		return link, err
 	}
 	return parsedURL.Hostname(), nil
+}
+
+// returns a stable bucket key for scheduling/rate limiting.
+// using eTLD+1 for key
+// TODO: might explode message queue when scaled, look into hashing keys when this breaks
+func GetBucketKey(link string) (string, error) {
+	parsedURL, err := url.Parse(link)
+	if err != nil {
+		return "", err
+	}
+
+	host := strings.ToLower(strings.TrimSpace(parsedURL.Hostname()))
+	if host == "" {
+		return "", ErrEmptyHost
+	}
+
+	if host == "localhost" || net.ParseIP(host) != nil {
+		return host, nil
+	}
+
+	bucket, err := publicsuffix.EffectiveTLDPlusOne(host)
+	if err != nil {
+		return host, nil
+	}
+
+	return strings.ToLower(bucket), nil
 }
